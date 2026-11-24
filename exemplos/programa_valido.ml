@@ -24,3 +24,7 @@ if (soma > 20) {
 
 ok = soma == 10;
 print(ok);
+
+z = 2;
+
+print(z);
