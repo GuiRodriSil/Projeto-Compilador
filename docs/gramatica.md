@@ -18,6 +18,7 @@ O alfabeto de entrada Σ são os caracteres ASCII imprimíveis mais espaço, tab
 Ignorados pelo lexer (não viram tokens):
 - espaços em branco: `[ \t\r\n]+`
 - comentários de linha: `//[^\n]*`
+- comentários de bloco: `/\*([^*]|\*+[^*/])*\*+/` (ou seja, `/* ... */`, sem aninhamento). Um `/*` sem o `*/` correspondente é **erro léxico** (comentário não fechado).
 
 Regras de desambiguação:
 - **Maior casamento (maximal munch):** `<=` é um token `LE`, e não `<` seguido de `=`. O mesmo vale para `>=`, `==` e `!=`.
@@ -185,3 +186,83 @@ y = true + 1;
 **Justificativa:** sintaticamente, `while (x)` é válido porque `IDENT` é uma `expressao`. Mas a condição de um laço precisa ser do tipo `bool`, e `x` é `int`. A restrição de tipo da condição foi violada, e a execução para no primeiro erro. A linha `y = true + 1;` também está errada, porque `+` exige dois `int` e recebe `bool + int`.
 
 Mensagem esperada: `Erro semântico (linha 2): condição do while deve ser booleana, obtido int`.
+
+## 5. Lexer
+
+Implementação: [src/lexer.py](../src/lexer.py). O lexer implementa diretamente o autômato finito determinístico descrito abaixo e, a cada token, consome o maior lexema possível (regra do maior casamento).
+
+### 5.1 Tabela de tokens
+
+| Tipo | Padrão (expressão regular) | Exemplo |
+|---|---|---|
+| `IF` | `if` | `if` |
+| `ELSE` | `else` | `else` |
+| `WHILE` | `while` | `while` |
+| `FOR` | `for` | `for` |
+| `PRINT` | `print` | `print` |
+| `TRUE` | `true` | `true` |
+| `FALSE` | `false` | `false` |
+| `IDENT` | `[a-zA-Z_][a-zA-Z0-9_]*` − palavras reservadas | `soma`, `x1`, `_tmp` |
+| `INT` | `[0-9]+` (não seguido de `[a-zA-Z_]`) | `0`, `42` |
+| `PLUS` | `\+` | `+` |
+| `MINUS` | `-` | `-` |
+| `STAR` | `\*` | `*` |
+| `SLASH` | `/` (não seguido de `/` ou `*`) | `/` |
+| `LT` | `<` | `<` |
+| `GT` | `>` | `>` |
+| `LE` | `<=` | `<=` |
+| `GE` | `>=` | `>=` |
+| `EQ` | `==` | `==` |
+| `NE` | `!=` | `!=` |
+| `ASSIGN` | `=` | `=` |
+| `LPAREN` / `RPAREN` | `\(` / `\)` | `(` `)` |
+| `LBRACE` / `RBRACE` | `\{` / `\}` | `{` `}` |
+| `SEMI` | `;` | `;` |
+| *(descartado)* | `[ \t\r\n]+` | espaço |
+| *(descartado)* | `//[^\n]*` | `// nota` |
+| *(descartado)* | `/\*([^*]\|\*+[^*/])*\*+/` | `/* nota */` |
+| `EOF` | fim da entrada | — |
+
+### 5.2 Autômato e tabela de transições
+
+Classes de caracteres usadas como símbolos de entrada:
+- **L** = `[a-zA-Z_]` (letras e `_`)
+- **D** = `[0-9]` (dígitos)
+- **E** = `[ \t\r\n]` (espaços)
+- **\n** = quebra de linha
+- **eof** = fim da entrada
+- **outro** = qualquer caractere que não aparece na linha
+- **∅** = sem transição: o autômato para e emite o token do estado final (se for final) ou sinaliza erro
+
+Estados: `q0` é o estado inicial. Estados finais estão marcados com `*` e indicam o token emitido. Estados `ERR_*` são estados de erro léxico.
+
+| Estado | L | D | E | `+ - * ( ) { } ;` | `/` | `*` | `<` `>` | `=` | `!` | `\n` | eof | outro |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| q0 | q_id | q_int | q0 | q_simb | q_barra | q_simb | q_rel | q_atr | q_excl | q0 | aceita EOF | ERR_char |
+| q_id* (IDENT/reservada) | q_id | q_id | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ |
+| q_int* (INT) | ERR_num | q_int | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ |
+| q_simb* (símbolo simples) | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ |
+| q_barra* (SLASH) | ∅ | ∅ | ∅ | ∅ | q_cl | q_cb | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ |
+| q_cl (comentário de linha) | q_cl | q_cl | q_cl | q_cl | q_cl | q_cl | q_cl | q_cl | q_cl | q0 | q0 | q_cl |
+| q_cb (comentário de bloco) | q_cb | q_cb | q_cb | q_cb | q_cb | q_cbe | q_cb | q_cb | q_cb | q_cb | ERR_com | q_cb |
+| q_cbe (bloco, leu `*`) | q_cb | q_cb | q_cb | q_cb | q0 | q_cbe | q_cb | q_cb | q_cb | q_cb | ERR_com | q_cb |
+| q_rel* (LT/GT) | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | q_rel2 | ∅ | ∅ | ∅ | ∅ |
+| q_rel2* (LE/GE) | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ |
+| q_atr* (ASSIGN) | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | q_eq | ∅ | ∅ | ∅ | ∅ |
+| q_eq* (EQ) | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ |
+| q_excl (não final) | ERR_excl | ERR_excl | ERR_excl | ERR_excl | ERR_excl | ERR_excl | ERR_excl | q_ne | ERR_excl | ERR_excl | ERR_excl | ERR_excl |
+| q_ne* (NE) | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ | ∅ |
+
+Observações:
+- Ao chegar em um estado final sem transição (∅), o token é emitido e o autômato volta a q0.
+- Ao voltar a q0 a partir de um comentário, nada é emitido.
+- Depois que um lexema chega a `q_id`, ele é consultado na tabela de palavras reservadas para decidir entre o token reservado e `IDENT`.
+
+Estados de erro e mensagens:
+
+| Estado | Mensagem |
+|---|---|
+| `ERR_char` | caractere inválido 'c' |
+| `ERR_num` | número mal formado (ex.: `1x`) |
+| `ERR_com` | comentário de bloco não fechado |
+| `ERR_excl` | '!' deve ser seguido de '=' |
