@@ -338,3 +338,97 @@ Não comparamos com a **LR(0)**, porque ela nem se aplica à gramática da MiniL
 **Por que não foi escolhida:** o poder extra da SLR(1) não é necessário, porque a gramática da MiniLang já foi escrita em forma LL(1), sem recursão à esquerda e com FIRST disjuntos. Usar SLR(1) exigiria um gerador externo ou montar à mão um autômato de dezenas de estados. Também pioraria as mensagens de erro, que são centrais no cenário do projeto: uma plataforma didática para alunos que precisam "enxergar" o compilador funcionando.
 
 
+
+## Interpretador
+
+O interpretador ([src/interpreter.py](../src/interpreter.py)) percorre a AST recursivamente. Há um método `_exec_<Nó>` para cada comando e um método `avaliar` para as expressões. As verificações semânticas são feitas **durante a execução**: cada operação confere os tipos dos valores antes de ser aplicada.
+
+Para executar um arquivo: `python -m src.interpreter exemplos/programa_valido.ml`.
+
+### Tabela de símbolos
+
+**Estrutura.** A tabela é um dicionário (tabela hash) `nome → (tipo, valor)`, em que `tipo ∈ {int, bool}`. Há **um único escopo global**, porque escopo aninhado está fora do escopo do projeto. Um `{ ... }` não cria escopo novo, e a variável de controle do `for` continua existindo depois do laço.
+
+| Operação | Assinatura | Comportamento | Custo |
+|---|---|---|---|
+| Inserção | `inserir(nome, valor, linha)` | Se `nome` não existe, cria a entrada `(tipo_de(valor), valor)`. Se existe com o mesmo tipo, atualiza o valor. Se existe com outro tipo, lança *tipo incompatível*. | O(1) em média |
+| Busca | `buscar(nome, linha)` | Devolve o valor. Se `nome` não existe, lança *variável 'nome' não definida*. | O(1) em média |
+
+**Por que essa tabela é suficiente.** As verificações semânticas exigidas são três, e cada uma usa uma informação da tabela:
+
+| Verificação | Como a tabela atende |
+|---|---|
+| Variável não definida | A presença da chave registra se a variável já recebeu atribuição. `buscar` falha se ela não recebeu. |
+| Tipo incompatível | O tipo armazenado permite recusar uma reatribuição com tipo diferente. Os tipos dos operandos vêm dos valores (`tipo_de`), então os operadores podem conferir os tipos. |
+| Condição de laço não booleana | O valor buscado tem tipo conhecido, e `_condicao` exige `bool`. |
+
+Não há funções nem escopos aninhados. Por isso não é preciso uma pilha de escopos nem guardar a aridade ou a assinatura de funções.
+
+### Semântica operacional
+
+**Notação:**
+- σ é o estado, isto é, o conteúdo da tabela de símbolos;
+- ⟨e, σ⟩ ⇓ v significa "a expressão *e* avaliada no estado σ resulta no valor *v*";
+- ⟨c, σ⟩ → σ' significa "o comando *c* executado em σ leva ao estado σ'";
+- **erro** interrompe a execução com `SemanticError`.
+
+**Expressões**
+
+| Regra | Semântica |
+|---|---|
+| Literal | ⟨n, σ⟩ ⇓ n; ⟨true, σ⟩ ⇓ true; ⟨false, σ⟩ ⇓ false |
+| Variável | ⟨x, σ⟩ ⇓ σ(x) se x ∈ dom(σ); senão **erro** "variável não definida" |
+| Unário | ⟨e, σ⟩ ⇓ n, n ∈ int ⟹ ⟨-e, σ⟩ ⇓ −n; se n ∈ bool, **erro** de tipo |
+| Aritmético | ⟨e₁, σ⟩ ⇓ n₁ e ⟨e₂, σ⟩ ⇓ n₂, ambos int ⟹ ⟨e₁ ⊕ e₂, σ⟩ ⇓ n₁ ⊕ n₂, com ⊕ ∈ {+, −, *}. Se algum operando for bool, **erro** de tipo. |
+| Divisão | Como o aritmético, mas com n₂ ≠ 0 e resultado trunc(n₁ / n₂), truncado em direção a zero. Se n₂ = 0, **erro** "divisão por zero". |
+| Relacional | n₁ e n₂ int ⟹ ⟨e₁ ⋈ e₂, σ⟩ ⇓ (n₁ ⋈ n₂) ∈ bool, com ⋈ ∈ {<, >, <=, >=} |
+| Igualdade | v₁ e v₂ do mesmo tipo ⟹ ⟨e₁ == e₂, σ⟩ ⇓ (v₁ = v₂); `!=` dá a negação. Tipos diferentes dão **erro**. |
+
+Os operandos são avaliados da esquerda para a direita: primeiro e₁, depois e₂.
+
+**Comandos**
+
+| Comando | Semântica |
+|---|---|
+| Atribuição | ⟨e, σ⟩ ⇓ v ⟹ ⟨x = e, σ⟩ → σ[x ↦ v]. Se x ∈ dom(σ) e o tipo de σ(x) é diferente do tipo de v, **erro**. |
+| Print | ⟨e, σ⟩ ⇓ v ⟹ ⟨print(e), σ⟩ → σ, e v é escrito na saída (`true`/`false` para booleanos) |
+| Bloco | ⟨c₁, σ⟩ → σ₁, …, ⟨cₙ, σₙ₋₁⟩ → σₙ ⟹ ⟨{c₁ … cₙ}, σ⟩ → σₙ. O bloco vazio deixa σ igual. |
+| If | Se ⟨e, σ⟩ ⇓ true, executa o bloco *entao*. Se ⇓ false, executa o *senao*; sem `else`, o estado fica σ. Se o valor não é bool, **erro**. |
+| While | ⟨e, σ⟩ ⇓ false ⟹ ⟨while(e) S, σ⟩ → σ. ⟨e, σ⟩ ⇓ true e ⟨S, σ⟩ → σ' ⟹ ⟨while(e) S, σ⟩ → ⟨while(e) S, σ'⟩, ou seja, repete. Se o valor não é bool, **erro**. |
+| For | ⟨for(I; e; A) S, σ⟩ executa I primeiro e depois repete: **testa** e; se false, termina; se true, **executa** S, **executa** A e volta ao teste. Se o valor não é bool, **erro**. |
+| Programa | Executa os comandos em sequência a partir de σ₀ = ∅. |
+
+**Relação entre o `for` e o `while`.** Pela semântica acima, `for (I; e; A) S` tem o mesmo efeito que `I; while (e) { S A }`. A implementação segue exatamente essa ordem: `executar(init)`, depois um laço que faz `_condicao(cond)`, `executar(corpo)` e `executar(atualizacao)`.
+
+**Limite de iterações.** Cada laço conta suas iterações. Se passar de `max_iteracoes` (100 000 por padrão), lança *limite de iterações excedido (possível laço infinito)*. Isso não muda a semântica dos programas que terminam dentro do limite. É uma proteção para que a suíte de testes nunca trave.
+
+### Justificativa formal
+
+**Executa os programas válidos.** Um programa válido passou pelo lexer e pelo parser e, portanto, tem uma AST. O interpretador define um caso para cada tipo de nó (os métodos `_exec_*` e os ramos de `avaliar`), e cada caso implementa a regra correspondente da tabela acima. Por indução estrutural sobre a AST:
+- **casos base:** literais e variáveis são avaliados conforme as regras;
+- **passo indutivo:** se os filhos de um nó são avaliados ou executados corretamente, o nó também é, porque o método combina os resultados dos filhos exatamente como a regra manda.
+
+Para os laços, a indução é sobre o número de iterações:
+- se a condição é falsa na entrada, o estado não muda (teste *laço que não executa*);
+- se cada iteração executa o corpo corretamente, *n* iterações levam ao estado σₙ dado por *n* aplicações da regra.
+
+Os testes de `tests/validos/test_interpreter_valido.py` conferem a saída e o estado final da tabela.
+
+**Rejeita os programas inválidos.** Cada restrição semântica da seção 2 do `gramatica.md` tem um único ponto de verificação no código, executado antes da operação que poderia violá-la:
+
+| Restrição | Onde é verificada |
+|---|---|
+| Variável definida antes do uso | `TabelaSimbolos.buscar`. Toda leitura de variável passa por ela, inclusive na condição e na atualização do `for`. |
+| Operandos `int` em `+ - * /`, `-` unário e `< > <= >=` | `_exigir_int` |
+| `==` e `!=` com tipos iguais | `_binario` |
+| Condição booleana em `if`, `while` e `for` | `_condicao`. É chamada **antes de cada iteração**, então uma condição que deixa de ser bool no meio do laço também é rejeitada. |
+| Divisão por zero | `_binario`, antes de dividir |
+| Tipo consistente na reatribuição | `TabelaSimbolos.inserir` |
+
+Como não existe caminho de execução que aplique uma operação sem passar pelo seu ponto de verificação, nenhum programa que viole uma restrição termina normalmente: ele sempre para com `SemanticError`, que indica a linha.
+
+Os casos exigidos pelo enunciado estão em `tests/invalidos/test_interpreter_invalido.py`:
+- **condição não booleana em laço:** `while (x)` com `x` int, e um `for` com condição `i + 1`;
+- **variável de controle não definida:** `while (contador < 5)` sem atribuição anterior, além de variáveis não definidas na condição e na atualização do `for`.
+
+As verificações são **dinâmicas**: o erro aparece quando o comando é executado. Por isso, o que foi impresso antes do erro continua na saída. Um erro dentro de um ramo que nunca é executado não é detectado. Essa limitação é conhecida e aceitável num interpretador. Ela seria eliminada por uma fase de análise semântica estática antes da execução, que ficou fora do escopo.
