@@ -164,3 +164,177 @@ Os testes em `tests/validos/test_ast.py` comprovam isso:
 - os parênteses não geram nós;
 - o `for` tem as três cláusulas nos campos certos;
 - a linha é registrada nos nós.
+
+## Análise sintática
+
+### Técnica adotada: descendente recursiva preditiva (LL(1))
+
+O parser ([src/parser.py](../src/parser.py)) tem **um método para cada não-terminal** da EBNF: `programa`, `comando`, `bloco`, `atribuicao`, `impressao`, `condicional`, `laco_while`, `laco_for`, `expressao`, `igualdade`, `relacional`, `aditiva`, `multiplicativa`, `unaria` e `primaria`. Cada método funciona assim:
+- um terminal da produção vira uma chamada a `_esperar(tipo)`;
+- um não-terminal vira uma chamada ao método correspondente;
+- `{ ... }` vira um laço `while`;
+- `[ ... ]` vira um `if`;
+- uma escolha entre alternativas é decidida olhando **um único token** à frente (`self.atual`).
+
+O parser não faz retrocesso (backtracking).
+
+**Por que a técnica é compatível com a gramática do item (a).** Um parser descendente recursivo sem retrocesso exige uma gramática LL(1), e a gramática satisfaz as condições:
+
+1. **Não há recursão à esquerda.** As regras de operadores usam repetição (`aditiva = multiplicativa { ("+"|"-") multiplicativa }`) em vez de `aditiva = aditiva "+" multiplicativa`. Com recursão à esquerda, o método `aditiva()` chamaria a si mesmo sem consumir nenhum token, em laço infinito.
+
+2. **Os conjuntos FIRST das alternativas são disjuntos.**
+
+   | Alternativa de `comando` | FIRST |
+   |---|---|
+   | atribuição | `IDENT` |
+   | impressão | `print` |
+   | condicional | `if` |
+   | `while` | `while` |
+   | `for` | `for` |
+   | bloco | `{` |
+
+   Em `primaria`, os FIRST são `INT`, `true`, `false`, `IDENT` e `(`. Em `unaria`, o `-` não pertence a FIRST(`primaria`). Logo, um único token decide a alternativa.
+
+3. **Partes opcionais e repetições não conflitam com FOLLOW.** O token que inicia cada parte opcional ou repetida não pode aparecer logo depois dela:
+
+   | Parte opcional ou repetida | Token que a inicia | FOLLOW (o que vem depois) |
+   |---|---|---|
+   | `[ "else" bloco ]` | `else` | FOLLOW(`condicional`) = FIRST(`comando`) ∪ {`}`, fim de arquivo} |
+   | `{ ("+" \| "-") ... }` | `+` `-` | FOLLOW(`aditiva`) = {`<` `>` `<=` `>=` `==` `!=` `)` `;`} |
+   | `{ ("*" \| "/") ... }` | `*` `/` | FOLLOW(`multiplicativa`) = FOLLOW(`aditiva`) ∪ {`+`, `-`} |
+
+   Nenhum token da coluna do meio aparece na coluna da direita da mesma linha. Assim, ao ver `else`, `+` ou `*`, o parser sabe com certeza que deve entrar na parte opcional ou repetida.
+
+**Como `while` e `for` são tratados.** Ao ver o token `while` ou `for`, o método `comando` chama `laco_while()` ou `laco_for()`. Esses métodos seguem a produção símbolo a símbolo.
+
+`laco_for()` implementa `"for" "(" atribuicao ";" expressao ";" atribuicao ")" bloco` nesta ordem:
+1. `_esperar("(")`;
+2. `atribuicao()`: **inicialização**;
+3. `_esperar(";")`;
+4. `expressao()`: **condição**;
+5. `_esperar(";")`;
+6. `atribuicao()`: **atualização**;
+7. `_esperar(")")`;
+8. `bloco()`.
+
+Como a gramática não tem alternativa vazia para nenhuma cláusula, o parser não tem como "pular" uma delas: se o token esperado não está lá, ele lança `ParserError`.
+
+### Árvores sintáticas
+
+**`1 + 2 * 3`.** Árvore de derivação (concreta), resumida:
+```
+expressao
+└─ igualdade
+   └─ relacional
+      └─ aditiva
+         ├─ multiplicativa ─ unaria ─ primaria ─ 1
+         ├─ "+"
+         └─ multiplicativa
+            ├─ unaria ─ primaria ─ 2
+            ├─ "*"
+            └─ unaria ─ primaria ─ 3
+```
+AST:
+```
+      (+)
+     /   \
+    1    (*)
+        /   \
+       2     3        valor = 1 + 6 = 7
+```
+
+**`(1 + 2) * 3`:**
+```
+expressao ─ igualdade ─ relacional ─ aditiva
+└─ multiplicativa
+   ├─ unaria ─ primaria
+   │           ├─ "("
+   │           ├─ expressao ─ … ─ aditiva
+   │           │                   ├─ multiplicativa ─ … ─ 1
+   │           │                   ├─ "+"
+   │           │                   └─ multiplicativa ─ … ─ 2
+   │           └─ ")"
+   ├─ "*"
+   └─ unaria ─ primaria ─ 3
+```
+AST:
+```
+        (*)
+       /   \
+     (+)    3
+    /   \
+   1     2            valor = 3 * 3 = 9
+```
+
+**Por que as duas árvores são diferentes.** Em `1 + 2 * 3`, o `*` só pode ser gerado dentro de `multiplicativa`, que é filho de `aditiva`. Por isso o `*` fica **mais fundo** na árvore e é avaliado primeiro. Em `(1 + 2) * 3`, os parênteses fazem `primaria` voltar a `expressao`. Assim o `+` vai para dentro de um operando do `*` e passa a ser avaliado primeiro. A forma da árvore define a ordem de avaliação, e por isso os resultados são diferentes (7 e 9).
+
+**`while (x > 0) { print(x); x = x - 1; }`:**
+```
+While
+├─ cond:  (>) ─ x , 0
+└─ corpo: Bloco
+          ├─ Print ─ x
+          └─ Atribuicao x ─ (-) ─ x , 1
+```
+
+**`for (i = 0; i < 5; i = i + 1) { soma = soma + i; }`, com as três cláusulas destacadas:**
+```
+For
+├─ [1] init:        Atribuicao i ─ 0
+├─ [2] cond:        (<) ─ i , 5
+├─ [3] atualizacao: Atribuicao i ─ (+) ─ i , 1
+└─ corpo:           Bloco
+                    └─ Atribuicao soma ─ (+) ─ soma , i
+```
+(Essas árvores são geradas por `src.ast_nodes.formatar`.)
+
+### Justificativa formal
+
+**Precedência.** O parser segue a cadeia `igualdade → relacional → aditiva → multiplicativa → unaria → primaria`, e cada método só chama o do nível seguinte. Logo:
+- um operador de nível *k* só tem como operandos subárvores de nível maior ou igual a *k + 1*;
+- um operador de precedência menor nunca fica abaixo de um de precedência maior, a não ser entre parênteses (`primaria → "(" expressao ")"`).
+
+Isso é exatamente a tabela de precedência da seção 3 do `gramatica.md`. Os testes `test_precedencia_multiplicacao_sobre_soma`, `test_comparacao_abaixo_da_aritmetica` e `test_igualdade_abaixo_da_relacional` comprovam o comportamento.
+
+**Associatividade.**
+- **Esquerda, para `+ - * /`.** O laço `while` de `aditiva` e `multiplicativa` faz `esq = Binario(op, esq, proximo)`. Em `a - b - c`, a primeira iteração cria `(a - b)` e a segunda cria `((a - b) - c)`. Por indução no número de operadores, a árvore sempre cresce para a esquerda (teste `test_associatividade_esquerda_subtracao`).
+- **Direita, para o `-` unário.** `unaria → "-" unaria` é recursiva à direita, então `- - 4` vira `-(-4)`.
+- **Não associativos, para os operadores relacionais e de igualdade.** `[ ... ]` aceita no máximo um operador. Um segundo operador gera erro (teste `test_relacionais_encadeados`).
+
+**Rejeição das entradas inválidas do item (a).** O parser aceita uma sequência de tokens se e somente se ela é derivável de `programa`. Isso vale porque o parser é LL(1): em cada passo existe no máximo uma produção aplicável, e todo token inesperado leva a `ParserError`. Para os exemplos do item (a):
+
+| Exemplo | Resultado |
+|---|---|
+| `for (i = 0; i < 10) { … }` | Depois de `expressao()`, `_esperar(";")` encontra `)`. Erro: *esperado ';' após a condição do for, encontrado ')'*. |
+| `x = (1 + ;` | `primaria()` encontra `;`, que não está em FIRST(`primaria`). Erro: *expressão esperada*. |
+| Exemplos 4 e 5 (semânticos) | São sintaticamente válidos e chegam ao interpretador, como devem. |
+| Exemplo 2 (léxico) | Não chega ao parser: o lexer rejeita antes. |
+
+Os testes em `tests/invalidos/test_parser_invalido.py` cobrem também `for` com cláusula vazia, `for` sem chaves, `while` sem parênteses, bloco não fechado e `else` sem `if`.
+
+### Comparação com a análise SLR(1)
+
+A alternativa escolhida para comparação é a **SLR(1)** (*Simple LR*). Ela é ascendente: lê os tokens empilhando-os (*shift*) e substitui o lado direito de uma produção pelo lado esquerdo (*reduce*) até chegar ao símbolo inicial. Sua construção segue três passos:
+1. a gramática é aumentada com uma nova produção inicial `S' → programa`;
+2. constrói-se a coleção canônica de **itens LR(0)**, que forma o autômato de estados (funções *closure* e *goto*);
+3. monta-se a tabela ACTION/GOTO, colocando uma redução `A → α` apenas nos tokens de **FOLLOW(A)**.
+
+Não comparamos com a **LR(0)**, porque ela nem se aplica à gramática da MiniLang. Na forma recursiva à esquerda que um parser LR usaria (`aditiva → aditiva "+" multiplicativa | multiplicativa`), o estado que contém o item `aditiva → multiplicativa •` também contém `multiplicativa → multiplicativa • "*" unaria`. A LR(0) reduz sem olhar o próximo token, então nesse estado ela teria um **conflito shift/reduce**. A SLR(1) resolve o conflito: só reduz se o próximo token pertence a FOLLOW(`aditiva`), e `*` não pertence.
+
+| Critério | Descendente recursivo LL(1) (adotado) | SLR(1) |
+|---|---|---|
+| Direção | Descendente: parte de `programa` e prevê as produções | Ascendente: parte dos tokens e reduz até `programa` |
+| Decisão | 1 token à frente, usando FIRST e FOLLOW das alternativas | Estado do autômato LR(0) + 1 token, com FOLLOW para as reduções |
+| Classe de gramáticas | LL(1): não aceita recursão à esquerda nem prefixos comuns | SLR(1): aceita recursão à esquerda; é estritamente maior que LL(1) |
+| Precedência e associatividade | Por níveis de não-terminais; a associatividade à esquerda vem do laço `while` | Natural: a recursão à esquerda já gera associatividade à esquerda |
+| Construção | Escrito diretamente a partir da EBNF, um método por regra | Coleção de itens com dezenas de estados; na prática exige um gerador (yacc, PLY) |
+| Mensagens de erro | Contextualizadas, porque cada método sabe onde está ("após a condição do for") | Genéricas: uma entrada vazia em ACTION diz só "token inesperado no estado *n*" |
+| Rastreabilidade | O código espelha a gramática, e a pilha de chamadas é a árvore em construção | A relação entre estado e gramática é indireta e difícil de explicar ao usuário |
+
+**Vantagens da SLR(1):** reconhece uma classe maior de gramáticas, aceita a recursão à esquerda sem transformar a gramática e expressa a associatividade à esquerda de forma natural.
+
+**Limitações da SLR(1):** a tabela é grande e difícil de construir e verificar à mão. Ainda aparecem conflitos em gramáticas que precisariam de LALR(1) ou LR(1) canônico. As mensagens de erro são pobres.
+
+**Por que não foi escolhida:** o poder extra da SLR(1) não é necessário, porque a gramática da MiniLang já foi escrita em forma LL(1), sem recursão à esquerda e com FIRST disjuntos. Usar SLR(1) exigiria um gerador externo ou montar à mão um autômato de dezenas de estados. Também pioraria as mensagens de erro, que são centrais no cenário do projeto: uma plataforma didática para alunos que precisam "enxergar" o compilador funcionando.
+
+
